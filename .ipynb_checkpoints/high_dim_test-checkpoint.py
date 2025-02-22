@@ -166,8 +166,7 @@ rmse_trace = []  # 用于保存每次迭代测试集 RMSE
 for it in range(num_iterations):
     print(f"\nGibbs iteration {it+1}/{num_iterations}")
     # 1. 更新全局 A 以及同步更新 jump_gp_results 中的 A_t, zeta_t, x_t_test 和 K_jump
-    K_cache_A = {q: compute_K_A_torch(X_test, sigma_a, sigma_q[q]) for q in range(len(sigma_q))}
-    A = gibbs_update_A_with_pyro(A, X_test, neighborhoods, jump_gp_results, K_cache_A, sigma_a, sigma_q,
+    A = gibbs_update_A_with_pyro(A, X_test, neighborhoods, jump_gp_results, sigma_a, sigma_q,
                                  **(pyro_update_params or {}))
     T_total = A.shape[0]
     for t in range(T_total):
@@ -201,8 +200,7 @@ for it in range(num_iterations):
     preds = []
     for t in range(T):
         pred = predict_test_point(jump_gp_results[t])
-        # preds.append(pred)
-        preds.append(torch.tensor(pred))
+        preds.append(pred)
     preds = torch.stack(preds)  # (T,)
     rmse = torch.sqrt(torch.mean((preds - Y_test)**2))
     rmse_trace.append(rmse.item())

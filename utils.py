@@ -94,7 +94,7 @@ def compute_jumpGP_kernel_torch(zeta, logtheta):
 def log_normal_pdf_torch(x, mean, var):
     return -0.5 * torch.log(2 * math.pi * var) - 0.5 * ((x - mean)**2 / var)
 
-def log_multivariate_normal_pdf_torch(x, mean, cov):
+def log_multivariate_normal_pdf_cholesky(x, mean, cov):
     cov = cov.to(torch.float64)
     diff = x - mean
     sign, logdet = torch.slogdet(cov)
@@ -102,6 +102,21 @@ def log_multivariate_normal_pdf_torch(x, mean, cov):
         cov = cov + 1e-6 * torch.eye(len(x), device=cov.device, dtype=cov.dtype)
         sign, logdet = torch.slogdet(cov)
     return -0.5 * (diff @ torch.inverse(cov) @ diff + logdet + len(x) * math.log(2 * math.pi))
+
+def log_multivariate_normal_pdf_torch(x, mean, cov):
+    #alternative to log_multivariate_normal_pdf_torch
+    cov = cov.to(torch.float64)
+    diff = (x - mean).unsqueeze(-1)
+    # 进行 Cholesky 分解
+    L = torch.linalg.cholesky(cov)
+    # 解线性方程组：L y = diff
+    sol = torch.cholesky_solve(diff, L)
+    quad = (diff.transpose(-1, -2) @ sol).squeeze()
+    # 计算对数行列式：log(det(cov)) = 2 * sum(log(diag(L)))
+    logdet = 2 * torch.sum(torch.log(torch.diag(L)))
+    D = x.shape[0]
+    return -0.5 * (quad + logdet + D * math.log(2 * math.pi))
+
 
 def transform_torch(A_t, x):
     return A_t @ x
@@ -500,7 +515,7 @@ def potential_fn_theta(theta, A, X_test):
             log_lik = log_lik - 0.5 * (logdet + quad)
     # log prior for theta
     # 对于 sigma_a: log p(theta_a) = - (alpha_a+1)*theta_a - beta_a/exp(theta_a) + theta_a
-    log_prior = alpha_a * theta[0] - beta_a / torch.exp(theta[0])
+    log_prior = -alpha_a * theta[0] - beta_a / torch.exp(theta[0])
     for q in range(Q):
         log_prior = log_prior - (alpha_q + 1) * theta[1+q] - beta_q / torch.exp(theta[1+q]) + theta[1+q]
     log_post = log_lik + log_prior
@@ -570,6 +585,9 @@ def potential_local_single(phi, jump_result):
     loglik_r = 0.0
     for j in range(M):
         g = w[0] + torch.dot(w[1:], zeta[j])
+        if not torch.isfinite(g):
+            print("Non-finite g detected:", g)
+        g = torch.clamp(g, -100, 100)
         p = torch.sigmoid(g)
         p = torch.clamp(p, 1e-10, 1-1e-10)
         if r[j]:
@@ -582,19 +600,20 @@ def potential_local_single(phi, jump_result):
     K_jump = compute_jumpGP_kernel_torch(zeta, logtheta)
     mean_vec = ms * torch.ones(M, device=K_jump.device, dtype=K_jump.dtype)
     
-    def log_multivariate_normal_pdf_torch(x, mean, cov):
-        cov = cov.to(torch.float64)
-        diff = x - mean
-        sign, logdet = torch.slogdet(cov)
-        if sign.item() <= 0:
-            cov = cov + 1e-6 * torch.eye(len(x), device=cov.device, dtype=cov.dtype)
-            sign, logdet = torch.slogdet(cov)
-        return -0.5 * (diff @ torch.inverse(cov) @ diff + logdet + len(x) * math.log(2 * math.pi))
+    # def log_multivariate_normal_pdf_torch(x, mean, cov):
+    #     cov = cov.to(torch.float64)
+    #     diff = x - mean
+    #     sign, logdet = torch.slogdet(cov)
+    #     if sign.item() <= 0:
+    #         cov = cov + 1e-6 * torch.eye(len(x), device=cov.device, dtype=cov.dtype)
+    #         sign, logdet = torch.slogdet(cov)
+    #     return -0.5 * (diff @ torch.inverse(cov) @ diff + logdet + len(x) * math.log(2 * math.pi))
     
     loglik_f = log_multivariate_normal_pdf_torch(f_t, mean_vec, K_jump)
 
     y_t = jump_result["y_neigh"]
     sigma_n = torch.exp(logtheta[-1])  # 噪声标准差
+    sigma_n = torch.clamp(sigma_n, min=1e-3)
 
     loglik_y = -0.5 * torch.sum((y_t - f_t)**2) / sigma_n**2 - M * torch.log(sigma_n) - 0.5 * M * math.log(2 * math.pi)
 
@@ -609,6 +628,8 @@ def potential_local_single(phi, jump_result):
     
     # 目标 log 后验为： loglik_r + loglik_f + log_prior
     log_post = loglik_r + loglik_f + loglik_y + log_prior
+    if not torch.isfinite(log_post):
+        return torch.tensor(1e6, dtype=torch.float64)
     return -log_post  # 返回负的 log 后验，作为 potential 函数
 
 
@@ -641,6 +662,7 @@ def update_r_for_test_point(jump_result, U=0.1):
     for j in range(M):
         # 计算 g = w[0] + dot(w[1:], zeta[j])
         g = w[0] + torch.dot(w[1:], zeta[j])
+        g = torch.clamp(g, -100, 100)
         p_mem = torch.sigmoid(g)
         p_mem = torch.clamp(p_mem, 1e-10, 1-1e-10)
         # 计算正态似然 L1 = N(y_j | f_j, sigma^2)
@@ -648,12 +670,71 @@ def update_r_for_test_point(jump_result, U=0.1):
         numerator = p_mem * L1
         denominator = numerator + (1 - p_mem) * U
         # p_z = numerator / (denominator + 1e-10)
-        p_z = torch.clamp(numerator / (denominator + 1e-10), 0.0, 1.0)
+        p_z = torch.clamp(numerator / (denominator + 1e-10), 1e-10, 1-1e-10)
         new_r[j] = (torch.rand(1, device=y.device) < p_z).bool().item()
     new_r = new_r.unsqueeze(1)  # 转换为 (M,1)
     model["r"] = new_r.clone()
     jump_result["jumpGP_model"] = model
     return jump_result
+
+# def sample_f_t_torch(jump_result):
+#     """
+#     对单个测试点 t 的 f^t 进行逐坐标 Gibbs 更新：
+#       对每个邻域点 j，固定其他 f 的值，计算 f_j 的后验分布，然后从中采样更新 f_j。
+    
+#     输入 jump_result 为字典，必须包含：
+#       - "jumpGP_model": 字典，其中 "ms" 为 m_t, "logtheta" 为局部 GP 超参数（形状 (Q+2,)），
+#            其中最后一个元素用于噪声标准差 sigma_t = exp(logtheta[-1]).
+#            另外，"r" 为布尔张量，形状 (M,1)。
+#       - "zeta_t": tensor of shape (M, Q) —— 经过 A_t 变换后的邻域输入
+#       - "y_neigh": tensor of shape (M,) —— 邻域响应
+#       - "f_t": tensor of shape (M,) —— 当前 f^t 值
+#     返回更新后的 f^t (tensor of shape (M,))
+#     """
+#     model = jump_result["jumpGP_model"]
+#     m_t = model["ms"]  # scalar, GP 均值
+#     logtheta = model["logtheta"]  # tensor of shape (Q+2,)
+#     sigma_t = torch.exp(logtheta[-1])
+#     sigma2 = sigma_t**2
+#     # r: (M,1) 转换为 1d float mask (1 if True, 0 if False)
+#     r = model["r"].flatten().to(torch.float64).float()  # shape (M,)
+#     y = jump_result["y_neigh"].to(torch.float64)  # (M,)
+#     zeta = jump_result["zeta_t"].to(torch.float64)  # (M, Q)
+#     f_current = jump_result["f_t"].to(torch.float64)  # (M,)
+#     M = zeta.shape[0]
+    
+#     # 计算协方差矩阵 C（先验协方差）：
+#     # C = compute_jumpGP_kernel_torch(zeta, logtheta)
+#     # 此处假设 compute_jumpGP_kernel_torch 已定义，返回 (M, M) 的核矩阵
+#     C = compute_jumpGP_kernel_torch(zeta, logtheta)
+    
+#     # 为了便于计算逐坐标条件分布，我们对每个 j 分块计算：
+#     f_new = f_current.clone()
+#     for j in range(M):
+#         # 令 I = {0,...,M-1} \ {j}
+#         idx = [i for i in range(M) if i != j]
+#         idx_tensor = torch.tensor(idx, dtype=torch.long, device=zeta.device)
+#         # 从 C 中提取相关块：
+#         C_jj = C[j, j]  # 标量
+#         C_jI = C[j, idx_tensor]  # (M-1,)
+#         C_II = C[idx_tensor][:, idx_tensor]  # (M-1, M-1)
+#         # 先验条件分布：
+#         # f_j | f_{-j} ~ N(m_prior, v_prior)
+#         # 其中 m_prior = m_t + C_jI * inv(C_II) * (f_current[idx] - m_t)
+#         f_minus = f_new[idx_tensor]
+#         invC_II = torch.inverse(C_II)
+#         m_prior = m_t + (C_jI @ (invC_II @ (f_minus - m_t * torch.ones_like(f_minus))))
+#         v_prior = C_jj - (C_jI @ (invC_II @ C_jI.T))
+#         # 如果 r[j]==1，则引入观测似然：
+#         if r[j] > 0.5:
+#             v_post = 1.0 / (1.0 / v_prior + 1.0 / sigma2)
+#             m_post = v_post * (m_prior / v_prior + y[j] / sigma2)
+#         else:
+#             v_post = v_prior
+#             m_post = m_prior
+#         # 采样 f_j ~ N(m_post, v_post)
+#         f_new[j] = m_post + torch.sqrt(v_post) * torch.randn(1, device=zeta.device, dtype=zeta.dtype)
+#     return f_new
 
 def sample_f_t_torch(jump_result):
     """
@@ -662,7 +743,7 @@ def sample_f_t_torch(jump_result):
     
     输入 jump_result 为字典，必须包含：
       - "jumpGP_model": 字典，其中 "ms" 为 m_t, "logtheta" 为局部 GP 超参数（形状 (Q+2,)），
-           其中最后一个元素用于噪声标准差 sigma_t = exp(logtheta[-1]).
+           其中最后一个元素用于噪声标准差 sigma_t = exp(logtheta[-1])。
            另外，"r" 为布尔张量，形状 (M,1)。
       - "zeta_t": tensor of shape (M, Q) —— 经过 A_t 变换后的邻域输入
       - "y_neigh": tensor of shape (M,) —— 邻域响应
@@ -674,17 +755,23 @@ def sample_f_t_torch(jump_result):
     logtheta = model["logtheta"]  # tensor of shape (Q+2,)
     sigma_t = torch.exp(logtheta[-1])
     sigma2 = sigma_t**2
+
     # r: (M,1) 转换为 1d float mask (1 if True, 0 if False)
     r = model["r"].flatten().to(torch.float64).float()  # shape (M,)
     y = jump_result["y_neigh"].to(torch.float64)  # (M,)
     zeta = jump_result["zeta_t"].to(torch.float64)  # (M, Q)
     f_current = jump_result["f_t"].to(torch.float64)  # (M,)
+
+    # 打印初始 f_current 状态
+    if torch.any(torch.isnan(f_current)):
+        print("Warning: f_current contains NaN:", f_current)
+
     M = zeta.shape[0]
     
-    # 计算协方差矩阵 C（先验协方差）：
-    # C = compute_jumpGP_kernel_torch(zeta, logtheta)
-    # 此处假设 compute_jumpGP_kernel_torch 已定义，返回 (M, M) 的核矩阵
+    # 计算协方差矩阵 C（先验协方差）
     C = compute_jumpGP_kernel_torch(zeta, logtheta)
+    if torch.any(torch.isnan(C)):
+        print("Warning: Covariance matrix C contains NaN.")
     
     # 为了便于计算逐坐标条件分布，我们对每个 j 分块计算：
     f_new = f_current.clone()
@@ -692,27 +779,61 @@ def sample_f_t_torch(jump_result):
         # 令 I = {0,...,M-1} \ {j}
         idx = [i for i in range(M) if i != j]
         idx_tensor = torch.tensor(idx, dtype=torch.long, device=zeta.device)
-        # 从 C 中提取相关块：
+        
+        # 从 C 中提取相关块
         C_jj = C[j, j]  # 标量
         C_jI = C[j, idx_tensor]  # (M-1,)
         C_II = C[idx_tensor][:, idx_tensor]  # (M-1, M-1)
-        # 先验条件分布：
-        # f_j | f_{-j} ~ N(m_prior, v_prior)
-        # 其中 m_prior = m_t + C_jI * inv(C_II) * (f_current[idx] - m_t)
+        
+        # 调试打印：检查当前 j 下相关矩阵是否存在 NaN 或极端值
+        if torch.isnan(C_jj):
+            print(f"Warning: C[{j},{j}] is NaN.")
+        if torch.any(torch.isnan(C_jI)):
+            print(f"Warning: C[{j}, I] contains NaN, indices:", idx)
+        if torch.any(torch.isnan(C_II)):
+            print(f"Warning: Submatrix C_II for index {j} contains NaN.")
+        
+        # 先验条件分布： f_j | f_{-j} ~ N(m_prior, v_prior)
         f_minus = f_new[idx_tensor]
-        invC_II = torch.inverse(C_II)
+        try:
+            invC_II = torch.inverse(C_II)
+        except RuntimeError as e:
+            print(f"Error in inverting C_II for index {j}: {e}")
+            invC_II = torch.pinverse(C_II)
+        
         m_prior = m_t + (C_jI @ (invC_II @ (f_minus - m_t * torch.ones_like(f_minus))))
         v_prior = C_jj - (C_jI @ (invC_II @ C_jI.T))
-        # 如果 r[j]==1，则引入观测似然：
+        
+        # 调试打印 m_prior 和 v_prior
+        if torch.isnan(m_prior):
+            print(f"Warning: m_prior is NaN at index {j}. f_minus: {f_minus}, m_t: {m_t}")
+        if torch.isnan(v_prior) or v_prior <= 0:
+            print(f"Warning: v_prior is invalid at index {j}. v_prior: {v_prior}, C_jj: {C_jj}, C_jI: {C_jI}")
+            v_prior = torch.clamp(v_prior, min=1e-6)
+        
+        # 如果 r[j]==1，则引入观测似然
         if r[j] > 0.5:
             v_post = 1.0 / (1.0 / v_prior + 1.0 / sigma2)
             m_post = v_post * (m_prior / v_prior + y[j] / sigma2)
         else:
             v_post = v_prior
             m_post = m_prior
+        
+        # 调试打印 m_post 和 v_post
+        if torch.isnan(m_post) or torch.isnan(v_post):
+            print(f"Warning: m_post or v_post is NaN at index {j}. m_post: {m_post}, v_post: {v_post}")
+        
         # 采样 f_j ~ N(m_post, v_post)
-        f_new[j] = m_post + torch.sqrt(v_post) * torch.randn(1, device=zeta.device, dtype=zeta.dtype)
+        try:
+            sample = m_post + torch.sqrt(v_post) * torch.randn(1, device=zeta.device, dtype=zeta.dtype)
+        except Exception as e:
+            print(f"Error sampling at index {j}: {e}. m_post: {m_post}, sqrt(v_post): {torch.sqrt(v_post)}")
+            sample = m_post  # 暂时赋值 m_post
+        if torch.isnan(sample):
+            print(f"Warning: Sampled f[{j}] is NaN.")
+        f_new[j] = sample
     return f_new
+
 
 
 def sample_local_hyperparams_single(initial_phi, jump_result, step_size=0.01, num_steps=10, num_samples=1, warmup_steps=50):
@@ -727,6 +848,8 @@ def sample_local_hyperparams_single(initial_phi, jump_result, step_size=0.01, nu
         return potential_local_single(phi, jump_result)
     
     init_params = {"phi": initial_phi.clone()}
+    # init_params = {"phi": initial_phi.clone().detach().requires_grad_(True)}
+
     pyro.clear_param_store()
     kernel = mcmc.NUTS(potential_fn=potential_fn, target_accept_prob=0.8,
                        step_size=step_size, max_tree_depth=num_steps)
